@@ -1,30 +1,55 @@
 use super::applescript::execute_applescript;
 
-/// Focus Ghostty terminal by TTY
-pub fn focus_ghostty_by_tty(tty: &str) -> Result<(), String> {
-    let script = format!(r#"
-        tell application "System Events"
-            if not (exists process "Ghostty") then
-                error "Ghostty not running"
-            end if
-        end tell
+/// Ghostty does not expose TTY via AppleScript, so TTY-based matching is not possible.
+pub fn focus_ghostty_by_tty(_tty: &str) -> Result<(), String> {
+    Err("Ghostty does not support TTY matching".to_string())
+}
 
+/// Focus Ghostty tab by matching working directory
+pub fn focus_ghostty_by_path(path: &str) -> Result<(), String> {
+    let dir_name = path.split('/').last().unwrap_or(path);
+
+    let script = format!(r#"
+        set targetTabIndex to 0
         tell application "Ghostty"
-            activate
             repeat with w in windows
                 repeat with t in tabs of w
                     repeat with term in terminals of t
-                        if tty of term contains "{}" then
-                            select tab t
-                            focus term
-                            return "found"
+                        if working directory of term contains "{0}" then
+                            set targetTabIndex to index of t
+                            exit repeat
                         end if
                     end repeat
+                    if targetTabIndex > 0 then exit repeat
                 end repeat
+                if targetTabIndex > 0 then exit repeat
             end repeat
         end tell
-        return "not found"
-    "#, tty);
+
+        if targetTabIndex is 0 then
+            return "not found"
+        end if
+
+        tell application "Ghostty" to activate
+        delay 0.2
+
+        tell application "System Events"
+            tell process "Ghostty"
+                if targetTabIndex ≤ 9 then
+                    keystroke (targetTabIndex as string) using command down
+                else
+                    keystroke "1" using command down
+                    delay 0.1
+                    repeat (targetTabIndex - 1) times
+                        keystroke "]" using {{command down, shift down}}
+                        delay 0.05
+                    end repeat
+                end if
+            end tell
+        end tell
+
+        return "found"
+    "#, dir_name);
 
     execute_applescript(&script)
 }

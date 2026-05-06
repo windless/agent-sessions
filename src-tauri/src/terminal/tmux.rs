@@ -1,23 +1,51 @@
 use std::process::Command;
+use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
 use super::applescript::execute_applescript;
 use super::ghostty;
 use super::iterm;
 use super::terminal_app;
 
+/// Run a command with a timeout, returning stdout or error
+fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let (tx, rx) = mpsc::channel();
+    let cmd = cmd.to_string();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+
+    thread::spawn(move || {
+        let output = Command::new(&cmd)
+            .args(&args)
+            .output();
+        let _ = tx.send(output);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        }
+        Ok(Err(e)) => Err(format!("Command error: {}", e)),
+        Err(_) => Err("Command timed out".to_string()),
+    }
+}
+
 /// Focus a tmux pane by matching its TTY
 /// Returns Ok if the pane was found and focused, Err otherwise
 pub fn focus_tmux_pane_by_tty(tty: &str) -> Result<(), String> {
-    // Check if tmux is running by listing panes
-    let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_tty} #{session_name}:#{window_index}.#{pane_index}"])
-        .output()
-        .map_err(|e| format!("Failed to run tmux: {}", e))?;
+    // Check if tmux is running by listing panes (2s timeout)
+    let panes = run_with_timeout(
+        "tmux",
+        &["list-panes", "-a", "-F", "#{pane_tty} #{session_name}:#{window_index}.#{pane_index}"],
+        Duration::from_secs(2),
+    ).map_err(|e| format!("{}", e))?;
 
-    if !output.status.success() {
-        return Err("tmux not running or no sessions".to_string());
+    if panes.trim().is_empty() {
+        return Err("No tmux panes found".to_string());
     }
-
-    let panes = String::from_utf8_lossy(&output.stdout);
 
     // Find the pane with matching TTY
     // TTY from ps is like "ttys003", tmux returns "/dev/ttys003"
