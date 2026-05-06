@@ -16,9 +16,14 @@ pub fn get_all_sessions() -> SessionsResponse {
 
 /// Focus the terminal containing a specific session
 #[tauri::command]
-pub fn focus_session(pid: u32, project_path: String) -> Result<(), String> {
-    terminal::focus_terminal_for_pid(pid, &project_path)
-        .or_else(|_| terminal::focus_terminal_by_path(&project_path))
+pub async fn focus_session(pid: u32, project_path: String) -> Result<(), String> {
+    let project_path_clone = project_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        terminal::focus_terminal_for_pid(pid, &project_path)
+            .or_else(|_| terminal::focus_terminal_by_path(&project_path_clone))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Update the tray icon title with session counts
