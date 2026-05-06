@@ -1,4 +1,5 @@
 mod applescript;
+mod ghostty;
 mod iterm;
 mod terminal_app;
 mod tmux;
@@ -15,6 +16,11 @@ pub fn focus_terminal_for_pid(pid: u32) -> Result<(), String> {
         return Ok(());
     }
 
+    // Try Ghostty next
+    if ghostty::focus_ghostty_by_tty(&tty).is_ok() {
+        return Ok(());
+    }
+
     // Try iTerm2 next
     if iterm::focus_iterm_by_tty(&tty).is_ok() {
         return Ok(());
@@ -26,8 +32,37 @@ pub fn focus_terminal_for_pid(pid: u32) -> Result<(), String> {
 
 /// Fallback: focus terminal by matching path in session name
 pub fn focus_terminal_by_path(path: &str) -> Result<(), String> {
+    let dir_name = path.split('/').last().unwrap_or(path);
+
+    // Try Ghostty first (path-based)
+    let ghostty_script = format!(r#"
+        tell application "System Events"
+            if exists process "Ghostty" then
+                tell application "Ghostty"
+                    activate
+                    repeat with w in windows
+                        repeat with t in tabs of w
+                            repeat with term in terminals of t
+                                if name of term contains "{}" then
+                                    select tab t
+                                    focus term
+                                    return "found"
+                                end if
+                            end repeat
+                        end repeat
+                    end repeat
+                end tell
+            end if
+        end tell
+        return "not found"
+    "#, dir_name);
+
+    if execute_applescript(&ghostty_script).is_ok() {
+        return Ok(());
+    }
+
     // Fallback: focus by matching session name (which often contains the path) in iTerm2
-    let script = format!(r#"
+    let iterm_script = format!(r#"
         tell application "System Events"
             if exists process "iTerm2" then
                 tell application "iTerm2"
@@ -48,9 +83,9 @@ pub fn focus_terminal_by_path(path: &str) -> Result<(), String> {
             end if
         end tell
         return "not found"
-    "#, path.split('/').last().unwrap_or(path));
+    "#, dir_name);
 
-    execute_applescript(&script)
+    execute_applescript(&iterm_script)
 }
 
 /// Get the TTY device for a given PID using ps command

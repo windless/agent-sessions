@@ -1,5 +1,6 @@
 use std::process::Command;
 use super::applescript::execute_applescript;
+use super::ghostty;
 use super::iterm;
 use super::terminal_app;
 
@@ -72,6 +73,10 @@ fn focus_tmux_client_terminal() -> Result<(), String> {
     let tty_name = client_tty.split('/').last().unwrap_or(&client_tty);
 
     // Try to focus the terminal running this TTY
+    if ghostty::focus_ghostty_by_tty(tty_name).is_ok() {
+        return Ok(());
+    }
+
     if iterm::focus_iterm_by_tty(tty_name).is_ok() {
         return Ok(());
     }
@@ -86,10 +91,13 @@ fn focus_tmux_client_terminal() -> Result<(), String> {
 
 /// Fallback: Focus any terminal app that might be running tmux
 fn focus_any_terminal_with_tmux() -> Result<(), String> {
-    // Try iTerm2 first, then Terminal.app
+    // Try Ghostty first, then iTerm2, then Terminal.app
     let script = r#"
         tell application "System Events"
-            if exists process "iTerm2" then
+            if exists process "Ghostty" then
+                tell application "Ghostty" to activate
+                return "found"
+            else if exists process "iTerm2" then
                 tell application "iTerm2" to activate
                 return "found"
             else if exists process "Terminal" then
