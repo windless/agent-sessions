@@ -1,8 +1,11 @@
 use super::{AgentDetector, AgentProcess};
 use crate::session::{AgentType, Session, SessionStatus};
+use rusqlite::{Connection, params};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Mutex;
 
 pub struct OpenCodeDetector;
 
@@ -25,6 +28,15 @@ impl AgentDetector for OpenCodeDetector {
         }
         get_opencode_sessions(processes)
     }
+}
+
+// Test support: override the SQLite database path (primarily for unit tests)
+#[cfg(test)]
+static TEST_DB_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+pub fn set_test_db_path(path: PathBuf) {
+    *TEST_DB_PATH.lock().unwrap() = Some(path);
 }
 
 // JSON structures for OpenCode data files
@@ -106,8 +118,438 @@ fn find_opencode_processes(system: &sysinfo::System) -> Vec<AgentProcess> {
     processes
 }
 
-/// Get OpenCode sessions from JSON files
+// ---------------------------------------------------------------------------
+// SQLite-backed session detection (primary)
+// ---------------------------------------------------------------------------
+
+/// Open the OpenCode SQLite database
+fn open_db() -> Result<Connection, rusqlite::Error> {
+    // Allow test override
+    #[cfg(test)]
+    {
+        let guard = TEST_DB_PATH.lock().unwrap();
+        if let Some(path) = guard.as_ref() {
+            if path.exists() {
+                log::debug!("Opening test OpenCode SQLite database: {:?}", path);
+                let conn = Connection::open(path)?;
+                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+                return Ok(conn);
+            }
+        }
+    }
+
+    let db_path = dirs::home_dir()
+        .ok_or_else(|| rusqlite::Error::InvalidPath(PathBuf::from("No home dir")))?
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+
+    log::debug!("Opening OpenCode SQLite database: {:?}", db_path);
+
+    if !db_path.exists() {
+        log::warn!("OpenCode SQLite database not found at: {:?}", db_path);
+        return Err(rusqlite::Error::InvalidPath(db_path));
+    }
+
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    Ok(conn)
+}
+
+/// Load projects from SQLite (excludes global project)
+fn load_projects_from_db(conn: &Connection) -> Vec<OpenCodeProject> {
+    let mut projects = Vec::new();
+
+    let mut stmt = match conn.prepare(
+        "SELECT id, worktree, sandboxes, name FROM project WHERE id != 'global'",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to prepare project query: {}", e);
+            return projects;
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let worktree: String = row.get(1)?;
+        let sandboxes_json: String = row.get(2)?;
+        Ok((id, worktree, sandboxes_json))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Failed to query projects: {}", e);
+            return projects;
+        }
+    };
+
+    for row in rows.flatten() {
+        let (id, worktree, sandboxes_json) = row;
+        let sandboxes: Vec<String> = serde_json::from_str(&sandboxes_json).unwrap_or_default();
+        projects.push(OpenCodeProject {
+            id,
+            worktree,
+            sandboxes,
+            time: OpenCodeTime::default(),
+        });
+    }
+
+    projects
+}
+
+/// Load all non-archived sessions from SQLite, joined with project worktree.
+/// Returns (session_data, project_worktree) tuples sorted by time_updated DESC.
+fn get_sessions_from_db(conn: &Connection) -> Vec<(OpenCodeSession, String)> {
+    let mut sessions = Vec::new();
+
+    let mut stmt = match conn.prepare(
+        "SELECT s.id, s.project_id, s.directory, s.title, s.time_updated, pj.worktree
+         FROM session s
+         JOIN project pj ON pj.id = s.project_id
+         WHERE (s.time_archived IS NULL OR s.time_archived = 0)
+         ORDER BY s.time_updated DESC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to prepare session query: {}", e);
+            return sessions;
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let project_id: String = row.get(1)?;
+        let directory: String = row.get(2)?;
+        let title: String = row.get(3)?;
+        let time_updated: u64 = row.get(4)?;
+        let worktree: String = row.get(5)?;
+
+        let session = OpenCodeSession {
+            id,
+            project_id,
+            directory,
+            title,
+            time: OpenCodeTime {
+                created: 0,
+                updated: time_updated,
+            },
+        };
+
+        Ok((session, worktree))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("Failed to query sessions: {}", e);
+            return sessions;
+        }
+    };
+
+    for row in rows.flatten() {
+        sessions.push(row);
+    }
+
+    sessions
+}
+
+/// Get the last message role, text, and timestamp for a session from SQLite
+fn get_last_message_from_db(
+    conn: &Connection,
+    session_id: &str,
+) -> (Option<String>, Option<String>, u64) {
+    let mut stmt = match conn.prepare(
+        "SELECT id, data, time_created FROM message WHERE session_id = ?1 ORDER BY time_created DESC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to prepare message query: {}", e);
+            return (None, None, 0);
+        }
+    };
+
+    let rows: Vec<(String, String, u64)> = match stmt
+        .query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        }) {
+        Ok(r) => r.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            log::error!("Failed to query messages: {}", e);
+            return (None, None, 0);
+        }
+    };
+
+    let message_count = rows.len();
+
+    for (message_id, data_json, time) in rows {
+        // Parse JSON data to extract the role field
+        let role: String = match serde_json::from_str::<serde_json::Value>(&data_json) {
+            Ok(val) => val
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(_) => continue,
+        };
+
+        if let Some(text) = get_message_text_from_db(conn, &message_id) {
+            log::debug!(
+                "Session {} has {} messages, showing: id={}, role={}, created={}",
+                session_id,
+                message_count,
+                message_id,
+                role,
+                time
+            );
+            return (Some(role), Some(text), time);
+        }
+    }
+
+    log::debug!(
+        "Session {} has {} messages but no displayable text",
+        session_id,
+        message_count
+    );
+    (None, None, 0)
+}
+
+/// Get message text from parts stored in SQLite
+fn get_message_text_from_db(conn: &Connection, message_id: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare("SELECT data FROM part WHERE message_id = ?1")
+        .ok()?;
+
+    let rows: Vec<String> = stmt
+        .query_map(params![message_id], |row| row.get::<_, String>(0))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut text_content: Option<String> = None;
+    let mut reasoning_content: Option<String> = None;
+
+    for data_json in rows {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_json) {
+            let part_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let text = val.get("text").and_then(|t| t.as_str());
+
+            if part_type == "text" {
+                text_content = text.map(String::from);
+            } else if part_type == "reasoning" && reasoning_content.is_none() {
+                reasoning_content = text.map(String::from);
+            }
+        }
+    }
+
+    let content = text_content.or(reasoning_content)?;
+
+    // Skip system prompts (XML-formatted instructions)
+    let trimmed = content.trim();
+    if trimmed.starts_with('<')
+        && (trimmed.contains("ultrawork") || trimmed.contains("mode>"))
+    {
+        return None;
+    }
+
+    // Truncate if too long
+    if content.len() > 200 {
+        Some(format!("{}...", &content[..197]))
+    } else {
+        Some(content)
+    }
+}
+
+/// Construct a Session from SQLite data, mirroring the JSON path's logic
+fn construct_session_from_db(
+    conn: &Connection,
+    session: &OpenCodeSession,
+    worktree: &str,
+    process: &AgentProcess,
+) -> Session {
+    let (last_role, last_message_text, _last_message_time) =
+        get_last_message_from_db(conn, &session.id);
+
+    let status = if process.cpu_usage > 5.0 {
+        SessionStatus::Processing
+    } else if last_role.as_deref() == Some("assistant") {
+        SessionStatus::Waiting
+    } else if last_role.as_deref() == Some("user") {
+        SessionStatus::Processing
+    } else {
+        SessionStatus::Idle
+    };
+
+    let updated_secs = session.time.updated / 1000;
+    let last_activity_at = chrono::DateTime::from_timestamp(updated_secs as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let actual_path = process
+        .cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| worktree.to_string());
+
+    let project_name = actual_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let display_message = last_message_text
+        .or_else(|| Some(session.title.clone()).filter(|t| !t.is_empty()));
+
+    log::info!(
+        "OpenCode session: id={}, project={}, status={:?}, last_role={:?}, cpu={:.1}%",
+        session.id,
+        project_name,
+        status,
+        last_role,
+        process.cpu_usage
+    );
+
+    Session {
+        id: session.id.clone(),
+        agent_type: AgentType::OpenCode,
+        project_name,
+        project_path: actual_path,
+        git_branch: None,
+        github_url: None,
+        status,
+        last_message: display_message,
+        last_message_role: last_role,
+        last_activity_at,
+        pid: process.pid,
+        cpu_usage: process.cpu_usage,
+        active_subagent_count: 0,
+    }
+}
+
+/// Detect sessions from SQLite database
+fn get_sessions_from_sqlite(conn: &Connection, processes: &[AgentProcess]) -> Vec<Session> {
+    let mut sessions = Vec::new();
+
+    // Build cwd -> process map
+    let mut cwd_to_process: HashMap<String, &AgentProcess> = HashMap::new();
+    for process in processes {
+        if let Some(cwd) = &process.cwd {
+            cwd_to_process.insert(cwd.to_string_lossy().to_string(), process);
+        }
+    }
+
+    // Load projects and sessions from DB
+    let projects = load_projects_from_db(conn);
+    let all_sessions = get_sessions_from_db(conn);
+
+    // Separate global sessions from project sessions; keep latest per project
+    let mut project_sessions: HashMap<String, (OpenCodeSession, String)> = HashMap::new();
+    let mut global_sessions: Vec<(OpenCodeSession, String)> = Vec::new();
+
+    for session_tuple in all_sessions {
+        if session_tuple.0.project_id == "global" {
+            global_sessions.push(session_tuple);
+        } else {
+            // Since DB query is sorted by time_updated DESC, the first entry per project is the latest
+            project_sessions
+                .entry(session_tuple.0.project_id.clone())
+                .or_insert(session_tuple);
+        }
+    }
+
+    // Track matched PIDs
+    let mut matched_pids = std::collections::HashSet::new();
+
+    // Match projects to running processes (non-global first)
+    for project in &projects {
+        if project.id == "global" {
+            continue;
+        }
+
+        // Check if any process is running in this project's worktree or sandboxes
+        let matching_process = cwd_to_process
+            .iter()
+            .find(|(cwd, _)| {
+                if cwd.as_str() == project.worktree
+                    || cwd.starts_with(&format!("{}/", project.worktree))
+                {
+                    return true;
+                }
+                for sandbox in &project.sandboxes {
+                    if cwd.as_str() == sandbox
+                        || cwd.starts_with(&format!("{}/", sandbox))
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
+            .map(|(_, p)| *p);
+
+        if let Some(process) = matching_process {
+            log::debug!(
+                "Project {} matched to process pid={}",
+                project.worktree,
+                process.pid
+            );
+            matched_pids.insert(process.pid);
+
+            if let Some((session, worktree)) = project_sessions.get(&project.id) {
+                let session = construct_session_from_db(conn, session, worktree, process);
+                sessions.push(session);
+            }
+        }
+    }
+
+    // For unmatched processes, check global sessions by directory field
+    for process in processes {
+        if matched_pids.contains(&process.pid) {
+            continue;
+        }
+        if let Some(cwd) = &process.cwd {
+            let cwd_str = cwd.to_string_lossy().to_string();
+            for (session, _worktree) in &global_sessions {
+                if cwd_str == session.directory
+                    || cwd_str.starts_with(&format!("{}/", session.directory))
+                {
+                    log::debug!(
+                        "Global session matched for directory {} to process pid={}",
+                        cwd_str,
+                        process.pid
+                    );
+                    let session =
+                        construct_session_from_db(conn, session, &session.directory, process);
+                    sessions.push(session);
+                    break;
+                }
+            }
+        }
+    }
+
+    sessions
+}
+
+/// Get OpenCode sessions — SQLite first, JSON fallback
 fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
+    match open_db() {
+        Ok(conn) => {
+            log::info!("Using OpenCode SQLite database for session detection");
+            let result = get_sessions_from_sqlite(&conn, processes);
+            let _ = conn.close();
+            return result;
+        }
+        Err(e) => {
+            log::warn!("SQLite unavailable ({}), falling back to JSON files", e);
+        }
+    }
+    get_sessions_from_json(processes)
+}
+
+/// Get OpenCode sessions from JSON files (legacy fallback)
+fn get_sessions_from_json(processes: &[AgentProcess]) -> Vec<Session> {
     let mut sessions = Vec::new();
 
     // OpenCode data directory: ~/.local/share/opencode/storage/
