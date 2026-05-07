@@ -48,6 +48,7 @@ struct OpenCodeProject {
     #[serde(default)]
     sandboxes: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     time: OpenCodeTime,
 }
 
@@ -76,6 +77,7 @@ struct OpenCodeSession {
 struct OpenCodeMessage {
     id: String,
     #[serde(rename = "sessionID")]
+    #[allow(dead_code)]
     session_id: String,
     role: String,
     #[serde(default)]
