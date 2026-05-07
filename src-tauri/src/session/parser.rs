@@ -1,5 +1,5 @@
 use log::{debug, info, trace, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -233,6 +233,109 @@ pub fn convert_dir_name_to_path(dir_name: &str) -> String {
     }
 }
 
+/// Normalize a CWD path for consistent comparison across sysinfo and JSONL sources.
+///
+/// Handles two common sources of mismatch:
+/// 1. Trailing slashes ("/foo/bar/" vs "/foo/bar")
+/// 2. macOS /private prefix on symlinked directories (/tmp vs /private/tmp, /var vs /private/var)
+fn normalize_cwd(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(stripped) = trimmed.strip_prefix("/private/") {
+            if stripped.starts_with("tmp")
+                || stripped.starts_with("var")
+                || stripped.starts_with("etc")
+            {
+                return format!("/{}", stripped);
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Convert a process CWD to the path Claude Code uses for its project directory.
+///
+/// When a Claude Code session runs inside a git worktree (e.g., inside
+/// `.claude/worktrees/<name>`), Claude Code stores the JSONL session files
+/// under the main repository's encoded path, not the worktree subdirectory.
+/// This function resolves the CWD to the path Claude Code actually uses.
+fn resolve_project_root(cwd: &str) -> String {
+    // If the CWD is inside a Claude Code worktree, use the parent repo path.
+    // Worktree paths look like: /path/to/repo/.claude/worktrees/<branch-name>
+    if let Some(idx) = cwd.find("/.claude/worktrees/") {
+        let parent = &cwd[..idx];
+        warn!("  WORKTREE detected: cwd={} -> using parent repo={}", cwd, parent);
+        return normalize_cwd(parent);
+    }
+    normalize_cwd(cwd)
+}
+
+/// Match processes to their JSONL session files by checking which files each process
+/// has open via `lsof`. Returns a map of PID → JSONL file path.
+fn match_processes_to_files(processes: &[&crate::agent::AgentProcess], jsonl_files: &[PathBuf]) -> HashMap<u32, PathBuf> {
+    debug!("match_processes_to_files: {} processes, {} jsonl files",
+        processes.len(), jsonl_files.len());
+    if processes.is_empty() || jsonl_files.is_empty() {
+        debug!("  early return: empty input");
+        return HashMap::new();
+    }
+
+    let jsonl_set: HashSet<&PathBuf> = jsonl_files.iter().collect();
+    let pids: Vec<String> = processes.iter().map(|p| p.pid.to_string()).collect();
+    let pid_list = pids.join(",");
+
+    debug!("  running: lsof -p {} -Fn -l", pid_list);
+
+    let output = match Command::new("lsof")
+        .args(["-p", &pid_list, "-Fn", "-l"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("  lsof error: {:?}", e);
+            return HashMap::new();
+        }
+    };
+
+    debug!("  lsof exit: {}, stdout_len={}, stderr_len={}",
+        output.status, output.stdout.len(), output.stderr.len());
+
+    if !output.status.success() {
+        warn!("  lsof non-zero exit, stderr: {}", String::from_utf8_lossy(&output.stderr));
+        return HashMap::new();
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let mut current_pid: Option<u32> = None;
+    let mut result: HashMap<u32, PathBuf> = HashMap::new();
+    let mut jsonl_lines: Vec<String> = Vec::new();
+
+    for line in output_str.lines() {
+        if let Some(pid_str) = line.strip_prefix('p') {
+            current_pid = pid_str.parse().ok();
+        } else if let Some(file_path) = line.strip_prefix('n') {
+            let path = PathBuf::from(file_path);
+            if path.extension().map_or(false, |e| e == "jsonl") {
+                jsonl_lines.push(format!("pid={:?} path={}", current_pid, file_path));
+                if jsonl_set.contains(&path) {
+                    if let Some(pid) = current_pid {
+                        result.entry(pid).or_insert(path);
+                    }
+                }
+            }
+        }
+    }
+
+    debug!("  lsof found {} total jsonl files, {} matched our set:",
+        jsonl_lines.len(), result.len());
+    for line in &jsonl_lines {
+        warn!("    {}", line);
+    }
+
+    result
+}
+
 /// Get all active Claude Code sessions (delegates to agent module)
 pub fn get_sessions() -> SessionsResponse {
     crate::agent::get_all_sessions()
@@ -241,8 +344,11 @@ pub fn get_sessions() -> SessionsResponse {
 /// Internal function to get sessions for a specific agent type
 /// Called by agent detectors (ClaudeDetector, OpenCodeDetector, etc.)
 pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) -> Vec<Session> {
-    info!("=== Getting sessions for {:?} ===", agent_type);
-    debug!("Found {} processes total", processes.len());
+    info!("=== get_sessions_internal for {:?}: {} processes ===", agent_type, processes.len());
+    for p in processes {
+        debug!("  PROCESS: pid={}, cwd={:?}, cpu={:.1}%",
+            p.pid, p.cwd, p.cpu_usage);
+    }
 
     let mut sessions = Vec::new();
 
@@ -257,16 +363,25 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
     let mut dir_name_to_cwd: HashMap<String, String> = HashMap::new();
     for process in processes {
         if let Some(cwd) = &process.cwd {
-            let cwd_str = cwd.to_string_lossy().to_string();
-            let dir_name = convert_path_to_dir_name(&cwd_str);
-            debug!("Mapping process pid={} to cwd={} (dir={})", process.pid, cwd_str, dir_name);
+            let cwd_raw = cwd.to_string_lossy().to_string();
+            let project_root = resolve_project_root(&cwd_raw);
+            let dir_name = convert_path_to_dir_name(&project_root);
+            debug!("  MAP: pid={} raw_cwd={:?} project_root={} dir={}",
+                process.pid, cwd_raw, project_root, dir_name);
             expected_dir_names.insert(dir_name.clone());
-            dir_name_to_cwd.insert(dir_name, cwd_str.clone());
-            cwd_to_processes.entry(cwd_str).or_default().push(process);
+            dir_name_to_cwd.insert(dir_name, project_root.clone());
+            cwd_to_processes.entry(project_root).or_default().push(process);
         } else {
             warn!("Process pid={} has no cwd, skipping", process.pid);
         }
     }
+
+    debug!("cwd_to_processes has {} entries:", cwd_to_processes.len());
+    for (cwd, procs) in &cwd_to_processes {
+        debug!("  CWD={} -> {} processes: {:?}",
+            cwd, procs.len(), procs.iter().map(|p| p.pid).collect::<Vec<_>>());
+    }
+    debug!("expected_dir_names: {:?}", expected_dir_names);
 
     // Scan ~/.claude/projects for session files
     let claude_dir = dirs::home_dir()
@@ -292,10 +407,13 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
 
+            trace!("Checking project dir: {} (expected_set has it: {})",
+                dir_name, expected_dir_names.contains(dir_name));
+
             // Skip directories that can't match any running process.
             // This avoids opening hundreds of JSONL files in inactive project directories.
             if !expected_dir_names.contains(dir_name) {
-                trace!("Skipping unmatched project dir: {}", dir_name);
+                trace!("  SKIP: dir {} not in expected set", dir_name);
                 continue;
             }
 
@@ -304,72 +422,133 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
             // (e.g., agent-sessions and agent/sessions both encode to -...-agent-sessions)
             // so we need to match each file's cwd to the process's cwd individually.
             let jsonl_files = get_recently_active_jsonl_files(&path, 100);
+            debug!("  Found {} jsonl files: {:?}",
+                jsonl_files.len(),
+                jsonl_files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>());
             if jsonl_files.is_empty() {
-                trace!("Project {} has no recent JSONL files, skipping", dir_name);
+                trace!("  SKIP: no JSONL files in dir {}", dir_name);
                 continue;
             }
 
-            // Build a map of cwd -> list of JSONL files with that cwd
+            // Build a map of normalized cwd -> list of JSONL files with that cwd
             let mut cwd_to_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for jsonl_file in &jsonl_files {
-                let file_cwd = extract_cwd_from_jsonl(jsonl_file)
+                let raw_cwd = extract_cwd_from_jsonl(jsonl_file);
+                let file_cwd = raw_cwd.clone()
                     .or_else(|| dir_name_to_cwd.get(dir_name).cloned())
                     .unwrap_or_else(|| convert_dir_name_to_path(dir_name));
-                cwd_to_files.entry(file_cwd).or_default().push(jsonl_file.clone());
+                let normalized = normalize_cwd(&file_cwd);
+                trace!("    FILE: {:?} -> raw_cwd={:?} normalized={}",
+                    jsonl_file.file_name().unwrap_or_default(),
+                    raw_cwd, normalized);
+                cwd_to_files.entry(normalized).or_default().push(jsonl_file.clone());
             }
 
-            debug!("Project {} has {} distinct cwds across {} files",
-                   dir_name, cwd_to_files.len(), jsonl_files.len());
+            debug!("  cwd_to_files has {} entries:", cwd_to_files.len());
+            for (cwd, files) in &cwd_to_files {
+                debug!("    CWD={} -> {} files: {:?}",
+                    cwd, files.len(),
+                    files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>());
+            }
 
             // For each unique cwd, find matching processes and create sessions
             for (project_path, files_for_cwd) in &cwd_to_files {
+                debug!("  Looking for processes with cwd={}", project_path);
                 let matching_processes = match cwd_to_processes.get(project_path) {
-                    Some(procs) => procs,
-                    None => continue,
+                    Some(procs) => {
+                        debug!("    FOUND {} matching processes: {:?}",
+                            procs.len(), procs.iter().map(|p| p.pid).collect::<Vec<_>>());
+                        procs
+                    }
+                    None => {
+                        warn!("    NO matching processes (cwd key not in cwd_to_processes)");
+                        continue;
+                    }
                 };
 
-                debug!("  cwd {} -> {} processes, {} files",
-                       project_path, matching_processes.len(), files_for_cwd.len());
-
-                // Match processes to JSONL files
-                for (index, process) in matching_processes.iter().enumerate() {
-                    debug!("Matching process pid={} to JSONL file index {}", process.pid, index);
-                    if let Some(session) = find_session_for_process(files_for_cwd, &path, project_path, process, index, agent_type.clone()) {
-                    // Track status transitions
-                    let mut prev_status_map = PREVIOUS_STATUS.lock().unwrap();
-                    let prev_status = prev_status_map.get(&session.id).cloned();
-
-                    // Log status transition if it changed
-                    if let Some(prev) = &prev_status {
-                        if *prev != session.status {
-                            warn!(
-                                "STATUS TRANSITION: project={}, {:?} -> {:?}, cpu={:.1}%, file_age=?, last_msg_role={:?}",
-                                session.project_name, prev, session.status, session.cpu_usage, session.last_message_role
-                            );
-                        }
-                    }
-
-                    // Update stored status
-                    prev_status_map.insert(session.id.clone(), session.status.clone());
-                    drop(prev_status_map);
-
-                    info!(
-                        "Session created: id={}, project={}, status={:?}, pid={}, cpu={:.1}%",
-                        session.id, session.project_name, session.status, session.pid, session.cpu_usage
-                    );
-                    sessions.push(session);
-                } else {
-                    warn!("Failed to create session for process pid={} in project {}", process.pid, project_path);
+                // Match processes to JSONL files by checking open file descriptors.
+                // Falls back to index-based matching when lsof is unavailable.
+                let pid_to_file = match_processes_to_files(matching_processes, files_for_cwd);
+                let has_lsof_results = !pid_to_file.is_empty();
+                debug!("    lsof results: {} matches, has_results={}",
+                    pid_to_file.len(), has_lsof_results);
+                for (pid, file) in &pid_to_file {
+                    debug!("      lsof: pid={} -> {:?}", pid, file.file_name().unwrap_or_default());
                 }
-            }
+
+                for (index, process) in matching_processes.iter().enumerate() {
+                    // Try lsof-based match first, then fall back to index-based
+                    let jsonl_path = if let Some(file) = pid_to_file.get(&process.pid) {
+                        debug!("    MATCH lsof: pid={} index={} -> {:?}", process.pid, index, file.file_name().unwrap_or_default());
+                        Some(file.clone())
+                    } else if has_lsof_results {
+                        // lsof ran successfully but didn't find this PID — no file to match
+                        warn!("    SKIP pid={}: lsof ran but found no jsonl for this pid", process.pid);
+                        continue;
+                    } else {
+                        // lsof unavailable, fall back to index-based matching
+                        let fallback = files_for_cwd.get(index).cloned();
+                        debug!("    MATCH fallback: pid={} index={} -> {:?}",
+                            process.pid, index,
+                            fallback.as_ref().and_then(|f| f.file_name()));
+                        fallback
+                    };
+
+                    let Some(jsonl_path) = jsonl_path else {
+                        warn!("    SKIP pid={}: no jsonl_path (index {} >= files.len {})",
+                            process.pid, index, files_for_cwd.len());
+                        continue;
+                    };
+
+                    if let Some(session) = find_session_for_process(
+                        &jsonl_path,
+                        &path,
+                        project_path,
+                        process,
+                        agent_type.clone(),
+                    ) {
+                        debug!("    SESSION CREATED: id={} pid={} project={} status={:?}",
+                            session.id, session.pid, session.project_name, session.status);
+                        // Track status transitions
+                        let mut prev_status_map = PREVIOUS_STATUS.lock().unwrap();
+                        let prev_status = prev_status_map.get(&session.id).cloned();
+
+                        // Log status transition if it changed
+                        if let Some(prev) = &prev_status {
+                            if *prev != session.status {
+                                warn!(
+                                    "STATUS TRANSITION: project={}, {:?} -> {:?}, cpu={:.1}%, file_age=?, last_msg_role={:?}",
+                                    session.project_name, prev, session.status, session.cpu_usage, session.last_message_role
+                                );
+                            }
+                        }
+
+                        // Update stored status
+                        prev_status_map.insert(session.id.clone(), session.status.clone());
+                        drop(prev_status_map);
+
+                        info!(
+                            "Session created: id={}, project={}, status={:?}, pid={}, cpu={:.1}%",
+                            session.id, session.project_name, session.status, session.pid, session.cpu_usage
+                        );
+                        sessions.push(session);
+                    } else {
+                        warn!("    PARSE FAILED: pid={} file={:?} — parse_session_file returned None",
+                            process.pid, jsonl_path.file_name().unwrap_or_default());
+                    }
+                }
             }
         }
     }
 
-    info!(
-        "=== Session scan complete for {:?}: {} total ===",
+    warn!(
+        "=== get_sessions_internal complete for {:?}: {} sessions ===",
         agent_type, sessions.len()
     );
+    for s in &sessions {
+        warn!("  SESSION: id={} pid={} project={} status={:?}",
+            s.id, s.pid, s.project_name, s.status);
+    }
 
     sessions
 }
@@ -461,16 +640,14 @@ fn get_recently_active_jsonl_files(project_dir: &PathBuf, _expected_count: usize
         .collect()
 }
 
-/// Find a session for a specific process from available JSONL files
+/// Create a session for a process from a specific JSONL file
 fn find_session_for_process(
-    jsonl_files: &[PathBuf],
+    jsonl_path: &PathBuf,
     project_dir: &PathBuf,
     project_path: &str,
-    process: &AgentProcess,
-    index: usize,
+    process: &crate::agent::AgentProcess,
     agent_type: AgentType,
 ) -> Option<Session> {
-    let jsonl_path = jsonl_files.get(index)?;
     let mut session = parse_session_file(jsonl_path, project_path, process.pid, process.cpu_usage, agent_type)?;
 
     // Count active subagents for this session
