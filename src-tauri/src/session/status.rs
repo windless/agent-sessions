@@ -1,3 +1,4 @@
+use log::debug;
 use super::model::SessionStatus;
 
 /// Check if message content contains a tool_use block
@@ -154,39 +155,65 @@ pub fn determine_status(
     is_user_input_tool: bool,
     file_recently_modified: bool,
 ) -> SessionStatus {
-    match last_msg_type {
+    let status = match last_msg_type {
         Some("assistant") => {
             if has_tool_use && is_user_input_tool {
-                // Tool like AskUserQuestion - waiting for user input
+                debug!(
+                    "[determine_status] assistant + tool_use + user_input_tool => Waiting"
+                );
                 SessionStatus::Waiting
             } else if has_tool_use {
-                // Tool is executing - could take seconds or minutes
+                debug!(
+                    "[determine_status] assistant + tool_use (not user_input) => Processing"
+                );
                 SessionStatus::Processing
             } else if file_recently_modified {
-                // Text response but file is still being written to
-                // (streaming, compacting, or about to send tool_use)
+                debug!(
+                    "[determine_status] assistant + text + file_recently_modified => Processing"
+                );
                 SessionStatus::Processing
             } else {
-                // Assistant sent a text response and file is quiet - waiting for user
+                debug!(
+                    "[determine_status] assistant + text + file_stale => Waiting"
+                );
                 SessionStatus::Waiting
             }
         }
         Some("user") => {
             if is_local_command || is_interrupted {
-                // Local slash commands and interrupted requests don't trigger Claude
+                debug!(
+                    "[determine_status] user + local_cmd({})/interrupted({}) => Waiting",
+                    is_local_command, is_interrupted
+                );
                 SessionStatus::Waiting
             } else {
-                // User sent a message or tool result - Claude is working
+                debug!(
+                    "[determine_status] user + normal_msg => Thinking"
+                );
                 SessionStatus::Thinking
             }
         }
         _ => {
-            // Couldn't determine message type (e.g., only progress entries in lookback)
             if file_recently_modified {
+                debug!(
+                    "[determine_status] unknown_type({:?}) + file_recently_modified => Processing",
+                    last_msg_type
+                );
                 SessionStatus::Processing
             } else {
+                debug!(
+                    "[determine_status] unknown_type({:?}) + file_stale => Waiting",
+                    last_msg_type
+                );
                 SessionStatus::Waiting
             }
         }
-    }
+    };
+
+    debug!(
+        "[determine_status] input: msg_type={:?}, has_tool_use={}, has_tool_result={}, local_cmd={}, interrupted={}, user_input_tool={}, recent={} => {:?}",
+        last_msg_type, has_tool_use, _has_tool_result, is_local_command, is_interrupted, is_user_input_tool, file_recently_modified, status
+    );
+
+    status
 }

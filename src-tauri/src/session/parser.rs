@@ -434,7 +434,15 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
             let mut cwd_to_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for jsonl_file in &jsonl_files {
                 let raw_cwd = extract_cwd_from_jsonl(jsonl_file);
+                // Apply resolve_project_root so that worktree CWDs from JSONL
+                // match the resolved keys in cwd_to_processes (see also: process
+                // side where resolve_project_root is applied on the same line).
+                //
+                // Without this, a worktree session's JSONL (cwd = worktree path)
+                // maps to a different key than its process (cwd = main repo path)
+                // and the session is silently skipped.
                 let file_cwd = raw_cwd.clone()
+                    .map(|cwd| resolve_project_root(&cwd))
                     .or_else(|| dir_name_to_cwd.get(dir_name).cloned())
                     .unwrap_or_else(|| convert_dir_name_to_path(dir_name));
                 let normalized = normalize_cwd(&file_cwd);
