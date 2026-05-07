@@ -52,7 +52,6 @@ export function PetSprite({ state, config }: PetSpriteProps) {
     };
     return (
       <div
-        data-tauri-drag-region
         className="flex items-center justify-center rounded-full"
         style={{
           width: config.frameWidth,
@@ -68,7 +67,6 @@ export function PetSprite({ state, config }: PetSpriteProps) {
 
   return (
     <div
-      data-tauri-drag-region
       style={{
         width: config.frameWidth,
         height: config.frameHeight,
