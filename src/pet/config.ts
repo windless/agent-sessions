@@ -19,7 +19,7 @@ export type PetAnimationState = 'thinking' | 'processing' | 'waiting' | 'idle' |
 const ROBOT_CONFIG: CharacterConfig = {
   name: 'robot',
   sprite: '/pets/robot.png',
-  columns: 6,
+  columns: 4,
   frameWidth: 128,
   frameHeight: 128,
   frameRate: 500,

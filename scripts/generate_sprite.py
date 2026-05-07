@@ -1,7 +1,7 @@
 """Generate a compliant pixel-art robot sprite sheet for testing.
 
 Spec:
-  - Canvas: 768 × 384 pixels (6 columns × 3 rows)
+  - Canvas: 512 × 640 pixels (4 columns × 5 rows)
   - Frame: 128 × 128 pixels each, 18 frames total
   - Character fills ~60-70% of each frame, centered
   - Transparent background, hard pixel edges, limited palette (16-32 colors)
@@ -9,7 +9,7 @@ Spec:
 
 from PIL import Image
 
-W, H = 768, 384
+W, H = 512, 640
 FW, FH = 128, 128
 TARGET_FILL = 0.65  # Character should fill 65% of frame area
 
@@ -610,9 +610,11 @@ def main():
     # Assemble into sprite sheet
     sheet = new_frame(W, H)
     layout = [
-        (0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
-        (1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
-        (2, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5),
+        (0, 0), (0, 1), (0, 2), (0, 3),
+        (1, 0), (1, 1), (1, 2), (1, 3),
+        (2, 0), (2, 1), (2, 2), (2, 3),
+        (3, 0), (3, 1), (3, 2), (3, 3),
+        (4, 0), (4, 1),
     ]
     for (row, col), frame in zip(layout, frames):
         sheet.paste(frame, (col * FW, row * FH))
@@ -633,12 +635,12 @@ def main():
 
     # Verify
     verify = Image.open(out_path)
-    assert verify.size == (768, 384), f"Wrong size: {verify.size}"
+    assert verify.size == (512, 640), f"Wrong size: {verify.size}"
     assert verify.mode in ("RGBA", "RGB"), f"Wrong mode: {verify.mode}"
 
     # Check per-cell fill
-    for row in range(3):
-        for col in range(6):
+    for row in range(5):
+        for col in range(4):
             cell = verify.crop((col * FW, row * FH, (col + 1) * FW, (row + 1) * FH))
             non_alpha = sum(1 for px in range(cell.width) for py in range(cell.height)
                            if cell.getpixel((px, py))[3] > 0)
