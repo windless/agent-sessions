@@ -1,0 +1,16 @@
+{
+  "name": "robot",
+  "sprite": "/pets/robot.png",
+  "columns": 6,
+  "frameWidth": 128,
+  "frameHeight": 128,
+  "frameRate": 500,
+  "states": {
+    "idle":       { "startFrame": 0, "count": 4 },
+    "thinking":   { "startFrame": 4, "count": 4 },
+    "processing": { "startFrame": 8, "count": 4 },
+    "waiting":    { "startFrame": 12, "count": 4 },
+    "sleeping":   { "startFrame": 16, "count": 2 }
+  },
+  "defaultState": "sleeping"
+}
