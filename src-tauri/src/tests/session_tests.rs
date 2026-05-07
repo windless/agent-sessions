@@ -703,6 +703,83 @@ fn test_get_sessions_internal_process_without_cwd_is_skipped() {
     assert!(sessions.is_empty(), "Process without CWD should be skipped");
 }
 
+// Worktree path resolution tests
+
+#[test]
+fn test_resolve_project_root_worktree_path() {
+    // Worktree path → should resolve to parent repo
+    assert_eq!(
+        crate::session::parser::resolve_project_root("/Users/user/repo/.claude/worktrees/feature-branch"),
+        "/Users/user/repo"
+    );
+
+    // Worktree path with subdirectory (CWD inside worktree source)
+    assert_eq!(
+        crate::session::parser::resolve_project_root("/Users/user/repo/.claude/worktrees/feature-branch/src"),
+        "/Users/user/repo"
+    );
+
+    // Non-worktree path → unchanged
+    assert_eq!(
+        crate::session::parser::resolve_project_root("/Users/user/repo"),
+        "/Users/user/repo"
+    );
+
+    // Normal project path
+    assert_eq!(
+        crate::session::parser::resolve_project_root("/Users/user/Projects/my-project"),
+        "/Users/user/Projects/my-project"
+    );
+}
+
+#[test]
+fn test_resolve_project_root_edge_cases() {
+    // Path with trailing slash on worktree
+    assert_eq!(
+        crate::session::parser::resolve_project_root("/repo/.claude/worktrees/branch/"),
+        "/repo"
+    );
+
+    // Path containing ".claude" but not as a worktree directory
+    // e.g., a repo named "my.claude.project"
+    assert_eq!(
+        crate::session::parser::resolve_project_root("/Users/user/my.claude.project/src"),
+        "/Users/user/my.claude.project/src"
+    );
+}
+
+#[test]
+fn test_worktree_cwd_to_dir_name_round_trip() {
+    // Claude Code stores worktree session JSONL files in a SEPARATE directory
+    // that encodes the full worktree path, NOT under the main repo directory.
+    // The encoded directory name should match what appears in ~/.claude/projects/.
+    let worktree_cwd = "/Users/user/repo/.claude/worktrees/feature-branch";
+    let dir_name = crate::session::parser::convert_path_to_dir_name(worktree_cwd);
+    assert_eq!(dir_name, "-Users-user-repo--claude-worktrees-feature-branch");
+
+    // resolve_project_root is still used for display purposes (project_path in Session)
+    let resolved = crate::session::parser::resolve_project_root(worktree_cwd);
+    assert_eq!(resolved, "/Users/user/repo");
+
+    // Non-worktree path should encode normally
+    let normal_dir = crate::session::parser::convert_path_to_dir_name("/Users/user/repo");
+    assert_eq!(normal_dir, "-Users-user-repo");
+}
+
+#[test]
+fn test_worktree_jsonl_matching_key() {
+    // Verify that a worktree process CWD and its JSONL cwd produce the same matching key.
+    // Both should be normalized to the same string so cwd_to_processes lookup works.
+    let process_cwd = "/Users/user/repo/.claude/worktrees/feature-branch";
+    let jsonl_cwd = Some("/Users/user/repo/.claude/worktrees/feature-branch");
+
+    let process_key = crate::session::parser::normalize_cwd(process_cwd);
+    let jsonl_key = jsonl_cwd.map(|c| crate::session::parser::normalize_cwd(&c)).unwrap_or_default();
+
+    assert_eq!(process_key, jsonl_key, "Process and JSONL cwd keys must match");
+    assert_eq!(process_key, "/Users/user/repo/.claude/worktrees/feature-branch");
+}
+
 #[test]
 fn test_get_sessions_internal_process_with_nonexistent_project_is_skipped() {
     let processes = vec![AgentProcess {

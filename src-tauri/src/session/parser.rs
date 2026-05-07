@@ -238,7 +238,7 @@ pub fn convert_dir_name_to_path(dir_name: &str) -> String {
 /// Handles two common sources of mismatch:
 /// 1. Trailing slashes ("/foo/bar/" vs "/foo/bar")
 /// 2. macOS /private prefix on symlinked directories (/tmp vs /private/tmp, /var vs /private/var)
-fn normalize_cwd(path: &str) -> String {
+pub(crate) fn normalize_cwd(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     #[cfg(target_os = "macos")]
     {
@@ -260,7 +260,7 @@ fn normalize_cwd(path: &str) -> String {
 /// `.claude/worktrees/<name>`), Claude Code stores the JSONL session files
 /// under the main repository's encoded path, not the worktree subdirectory.
 /// This function resolves the CWD to the path Claude Code actually uses.
-fn resolve_project_root(cwd: &str) -> String {
+pub(crate) fn resolve_project_root(cwd: &str) -> String {
     // If the CWD is inside a Claude Code worktree, use the parent repo path.
     // Worktree paths look like: /path/to/repo/.claude/worktrees/<branch-name>
     if let Some(idx) = cwd.find("/.claude/worktrees/") {
@@ -364,13 +364,20 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
     for process in processes {
         if let Some(cwd) = &process.cwd {
             let cwd_raw = cwd.to_string_lossy().to_string();
+            // Use the RAW CWD (not resolved) for directory name matching.
+            // Claude Code stores worktree session files in a SEPARATE encoded
+            // directory (e.g., -repo--claude-worktrees-branch), not under the
+            // main repo directory. resolve_project_root would lose the worktree
+            // suffix, causing us to scan the wrong directory for JSONL files.
+            let dir_name = convert_path_to_dir_name(&cwd_raw);
             let project_root = resolve_project_root(&cwd_raw);
-            let dir_name = convert_path_to_dir_name(&project_root);
-            debug!("  MAP: pid={} raw_cwd={:?} project_root={} dir={}",
+            debug!("  MAP: pid={} raw_cwd={:?} resolved_root={} dir={}",
                 process.pid, cwd_raw, project_root, dir_name);
             expected_dir_names.insert(dir_name.clone());
-            dir_name_to_cwd.insert(dir_name, project_root.clone());
-            cwd_to_processes.entry(project_root).or_default().push(process);
+            dir_name_to_cwd.insert(dir_name, cwd_raw.clone());
+            // Use the raw (normalized) CWD as the matching key so both worktree
+            // and main-repo processes match against JSONL files in their own directory.
+            cwd_to_processes.entry(normalize_cwd(&cwd_raw)).or_default().push(process);
         } else {
             warn!("Process pid={} has no cwd, skipping", process.pid);
         }
@@ -434,15 +441,12 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
             let mut cwd_to_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for jsonl_file in &jsonl_files {
                 let raw_cwd = extract_cwd_from_jsonl(jsonl_file);
-                // Apply resolve_project_root so that worktree CWDs from JSONL
-                // match the resolved keys in cwd_to_processes (see also: process
-                // side where resolve_project_root is applied on the same line).
-                //
-                // Without this, a worktree session's JSONL (cwd = worktree path)
-                // maps to a different key than its process (cwd = main repo path)
-                // and the session is silently skipped.
+                // Use the raw CWD from JSONL as-is (no resolve_project_root).
+                // Claude Code stores worktree session JSONL files in a separate
+                // directory that matches the full worktree path encoding. If we
+                // resolved the CWD here, we'd look in the main repo directory
+                // and miss the worktree's own session files entirely.
                 let file_cwd = raw_cwd.clone()
-                    .map(|cwd| resolve_project_root(&cwd))
                     .or_else(|| dir_name_to_cwd.get(dir_name).cloned())
                     .unwrap_or_else(|| convert_dir_name_to_path(dir_name));
                 let normalized = normalize_cwd(&file_cwd);
@@ -511,7 +515,7 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
                     if let Some(session) = find_session_for_process(
                         &jsonl_path,
                         &path,
-                        project_path,
+                        &resolve_project_root(project_path),
                         process,
                         agent_type.clone(),
                     ) {
