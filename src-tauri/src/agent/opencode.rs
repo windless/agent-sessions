@@ -354,9 +354,10 @@ fn get_message_text_from_db(conn: &Connection, message_id: &str) -> Option<Strin
         return None;
     }
 
-    // Truncate if too long
-    if content.len() > 200 {
-        Some(format!("{}...", &content[..197]))
+    // Truncate if too long (safe for multi-byte UTF-8)
+    let truncated: String = content.chars().take(197).collect();
+    if truncated.len() < content.len() {
+        Some(format!("{}...", truncated))
     } else {
         Some(content)
     }
@@ -778,7 +779,7 @@ fn get_last_message(storage_path: &PathBuf, session_id: &str) -> (Option<String>
         if let Some(text) = get_message_text(storage_path, &message_id) {
             log::debug!(
                 "Session {} has {} messages, showing: id={}, role={}, created={}, text={:?}",
-                session_id, message_count, message_id, role, time, &text[..text.len().min(50)]
+                session_id, message_count, message_id, role, time, text.chars().take(50).collect::<String>()
             );
             return (Some(role), Some(text), time);
         }
@@ -830,9 +831,10 @@ fn get_message_text(storage_path: &PathBuf, message_id: &str) -> Option<String> 
         return None;
     }
 
-    // Truncate if too long
-    let truncated = if content.len() > 200 {
-        format!("{}...", &content[..197])
+    // Truncate if too long (safe for multi-byte UTF-8)
+    let truncated: String = content.chars().take(197).collect();
+    if truncated.len() < content.len() {
+        format!("{}...", truncated)
     } else {
         content
     };
