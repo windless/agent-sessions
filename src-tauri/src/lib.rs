@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod commands;
+pub mod desktop_pet;
 pub mod logging;
 pub mod process;
 pub mod session;
@@ -80,6 +81,9 @@ pub fn run() {
 
             // Store tray ID
             *TRAY_ID.lock().unwrap() = Some("main-tray".to_string());
+
+            // Spawn desktop pet window
+            desktop_pet::create_pet_window(app.handle());
 
             Ok(())
         })
