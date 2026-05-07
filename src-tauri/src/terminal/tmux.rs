@@ -3,7 +3,7 @@ use std::time::Duration;
 use std::sync::mpsc;
 use std::thread;
 use super::applescript::execute_applescript;
-use super::ghostty;
+
 use super::iterm;
 use super::terminal_app;
 
@@ -101,7 +101,22 @@ fn focus_tmux_client_terminal() -> Result<(), String> {
     let tty_name = client_tty.split('/').last().unwrap_or(&client_tty);
 
     // Try to focus the terminal running this TTY
-    if ghostty::focus_ghostty_by_tty(tty_name).is_ok() {
+    let tty_escaped = tty_name.replace('\\', "\\\\").replace('"', "\\\"");
+    let ghostty_script = format!(
+        r#"
+        tell application "Ghostty"
+            set matching_terms to every terminal whose tty contains "{}"
+            if (count of matching_terms) > 0 then
+                activate
+                focus item 1 of matching_terms
+                return "found:tty"
+            end if
+        end tell
+        return "not found"
+    "#,
+        tty_escaped
+    );
+    if execute_applescript(&ghostty_script).is_ok() {
         return Ok(());
     }
 

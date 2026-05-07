@@ -7,12 +7,11 @@ mod tmux;
 use applescript::execute_applescript;
 
 /// Focus the terminal containing the Claude process with the given PID
-pub fn focus_terminal_for_pid(pid: u32, project_path: &str) -> Result<(), String> {
+pub fn focus_terminal_for_pid(pid: u32, _project_path: &str) -> Result<(), String> {
     // First, get the TTY for this process
     let tty = get_tty_for_pid(pid)?;
 
-    // Ghostty doesn't expose TTY via AppleScript, match by working directory instead
-    if ghostty::focus_ghostty_by_path(project_path).is_ok() {
+    if ghostty::focus_ghostty_by_pid(pid).is_ok() {
         return Ok(());
     }
 
@@ -31,11 +30,6 @@ pub fn focus_terminal_for_pid(pid: u32, project_path: &str) -> Result<(), String
 
 /// Fallback: focus terminal by matching path in session name
 pub fn focus_terminal_by_path(path: &str) -> Result<(), String> {
-    // Try Ghostty first by working directory
-    if ghostty::focus_ghostty_by_path(path).is_ok() {
-        return Ok(());
-    }
-
     let dir_name = path.split('/').last().unwrap_or(path);
     let iterm_script = format!(r#"
         tell application "System Events"
