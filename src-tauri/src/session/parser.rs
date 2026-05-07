@@ -46,17 +46,17 @@ fn get_content_preview(content: &serde_json::Value) -> String {
     }
 }
 
-/// Extract the cwd (project path) from the first few lines of a JSONL file.
-/// Returns the first valid cwd found, which should be the project root.
+/// Extract the cwd (project path) from a JSONL file.
+/// Scans from the beginning of the file for the first valid cwd field.
+/// Claude Code writes cwd in every message, so it should appear early.
 fn extract_cwd_from_jsonl(jsonl_path: &PathBuf) -> Option<String> {
     let file = File::open(jsonl_path).ok()?;
     let reader = BufReader::new(file);
 
-    // Check first 20 lines for a cwd field
-    for line in reader.lines().take(20).flatten() {
+    // Check first 50 lines for a cwd field
+    for line in reader.lines().take(50).flatten() {
         if let Ok(msg) = serde_json::from_str::<JsonlMessage>(&line) {
             if let Some(cwd) = msg.cwd {
-                // Claude Code always writes absolute paths
                 if cwd.starts_with('/') {
                     return Some(cwd);
                 }
@@ -251,11 +251,17 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
     // Pre-compute expected project directory names from process CWDs.
     // This lets us skip scanning directories that can't match any running process.
     let mut expected_dir_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Reverse mapping: directory name → actual CWD path.
+    // convert_dir_name_to_path() is lossy (dashes in path segments vs separators are ambiguous),
+    // so when extract_cwd_from_jsonl fails, we look up the real CWD from this map instead.
+    let mut dir_name_to_cwd: HashMap<String, String> = HashMap::new();
     for process in processes {
         if let Some(cwd) = &process.cwd {
             let cwd_str = cwd.to_string_lossy().to_string();
-            debug!("Mapping process pid={} to cwd={}", process.pid, cwd_str);
-            expected_dir_names.insert(convert_path_to_dir_name(&cwd_str));
+            let dir_name = convert_path_to_dir_name(&cwd_str);
+            debug!("Mapping process pid={} to cwd={} (dir={})", process.pid, cwd_str, dir_name);
+            expected_dir_names.insert(dir_name.clone());
+            dir_name_to_cwd.insert(dir_name, cwd_str.clone());
             cwd_to_processes.entry(cwd_str).or_default().push(process);
         } else {
             warn!("Process pid={} has no cwd, skipping", process.pid);
@@ -307,10 +313,8 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
             let mut cwd_to_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for jsonl_file in &jsonl_files {
                 let file_cwd = extract_cwd_from_jsonl(jsonl_file)
-                    .unwrap_or_else(|| {
-                        // Fallback to decoded directory name if file has no cwd
-                        convert_dir_name_to_path(dir_name)
-                    });
+                    .or_else(|| dir_name_to_cwd.get(dir_name).cloned())
+                    .unwrap_or_else(|| convert_dir_name_to_path(dir_name));
                 cwd_to_files.entry(file_cwd).or_default().push(jsonl_file.clone());
             }
 
