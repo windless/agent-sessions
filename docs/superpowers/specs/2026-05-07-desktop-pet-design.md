@@ -68,6 +68,7 @@ Lifecycle:
 {
   "name": "robot",
   "sprite": "robot.png",
+  "columns": 6,
   "frameWidth": 128,
   "frameHeight": 128,
   "frameRate": 500,
@@ -101,8 +102,9 @@ New characters added by placing `<name>.json` + `<name>.png` in `src-tauri/pets/
 ### PetSprite.tsx
 
 - Receives `state: PetAnimationState` and `config: CharacterConfig`
-- Computes CSS `@keyframes` or inline style with stepped `background-position-x`
 - Renders a `<div>` sized to `frameWidth × frameHeight` with the sprite as background
+- Sprite sheet is a 2D grid (`columns` wide). Frame N maps to row `N / columns`, column `N % columns`
+- Computes `background-position` as both X and Y offsets: `-(col * frameWidth)`, `-(row * frameHeight)`
 - Fallback: if sprite image fails to load, renders a colored geometric shape with status label
 
 ### usePetState.ts

@@ -143,6 +143,7 @@ export interface CharacterState {
 export interface CharacterConfig {
   name: string;
   sprite: string;
+  columns: number; // frames per row in the sprite sheet grid
   frameWidth: number;
   frameHeight: number;
   frameRate: number; // ms per frame
@@ -155,6 +156,7 @@ export type PetAnimationState = 'thinking' | 'processing' | 'waiting' | 'idle' |
 const ROBOT_CONFIG: CharacterConfig = {
   name: 'robot',
   sprite: '/pets/robot.png',
+  columns: 6,
   frameWidth: 128,
   frameHeight: 128,
   frameRate: 500,
@@ -295,7 +297,18 @@ export function PetSprite({ state, config }: PetSpriteProps) {
 
   const handleError = useCallback(() => setImgError(true), []);
 
-  const bgX = -(stateConfig.startFrame + frameIndex) * config.frameWidth;
+  const absoluteFrame = stateConfig.startFrame + frameIndex;
+  const col = absoluteFrame % config.columns;
+  const row = Math.floor(absoluteFrame / config.columns);
+  const bgX = -(col * config.frameWidth);
+  const bgY = -(row * config.frameHeight);
+
+  // Total sprite sheet size
+  const totalFramesAll = Object.values(config.states).reduce(
+    (max, s) => Math.max(max, s.startFrame + s.count), 0
+  );
+  const sheetCols = config.columns;
+  const sheetRows = Math.ceil(totalFramesAll / sheetCols);
 
   // Fallback: colored shape when sprite image missing
   if (imgError) {
@@ -329,9 +342,9 @@ export function PetSprite({ state, config }: PetSpriteProps) {
         width: config.frameWidth,
         height: config.frameHeight,
         backgroundImage: `url(${config.sprite})`,
-        backgroundSize: `${config.frameWidth * 18}px ${config.frameHeight}px`,
+        backgroundSize: `${sheetCols * config.frameWidth}px ${sheetRows * config.frameHeight}px`,
         backgroundPositionX: bgX,
-        backgroundPositionY: 0,
+        backgroundPositionY: bgY,
         backgroundRepeat: 'no-repeat',
         imageRendering: 'pixelated',
         cursor: 'grab',
@@ -471,6 +484,7 @@ export function PetApp() {
 {
   "name": "robot",
   "sprite": "/pets/robot.png",
+  "columns": 6,
   "frameWidth": 128,
   "frameHeight": 128,
   "frameRate": 500,
@@ -512,8 +526,11 @@ Run this Python one-liner to create a 2304×128 transparent PNG with colored fra
 python3 -c "
 import struct, zlib
 
-width, height = 2304, 128
-# Each frame is 128x128 pixels. 18 frames in a horizontal strip.
+# 6 columns x 3 rows = 18 frames, each 128x128 pixels
+cols, rows = 6, 3
+frame_w, frame_h = 128, 128
+width = cols * frame_w   # 768
+height = rows * frame_h  # 384
 colors = [
     (148,163,184), (148,163,184), (148,163,184), (148,163,184),  # idle: gray
     (251,191,36),  (251,191,36),  (251,191,36),  (251,191,36),   # thinking: yellow
@@ -526,12 +543,14 @@ def make_chunk(chunk_type, data):
     c = chunk_type + data
     return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
 
+# Build raw pixel data row by row
 raw = b''
-for frame in range(18):
-    r, g, b = colors[frame]
-    pixel_row = bytes([r, g, b, 255]) * 128  # 128 identical pixels
-    for _ in range(128):                      # 128 rows per frame
-        raw += pixel_row
+for grid_row in range(rows):
+    for py in range(frame_h):
+        for grid_col in range(cols):
+            frame = grid_row * cols + grid_col
+            r, g, b = colors[frame] if frame < len(colors) else (255, 0, 255)
+            raw += bytes([r, g, b, 255]) * frame_w
 
 compressed = zlib.compress(raw)
 
@@ -648,6 +667,7 @@ describe('loadCharacterConfig', () => {
 
   it('returns config with all expected states', () => {
     const config = loadCharacterConfig('anything');
+    expect(config.columns).toBe(6);
     expect(config.states.idle.count).toBe(4);
     expect(config.states.thinking.count).toBe(4);
     expect(config.states.processing.count).toBe(4);
